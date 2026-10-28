@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Northbound: A Winter Dash</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, Segoe UI, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background: #07182b; color: #f4fbff; }
+    canvas { display: block; }
+    #hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); color: #d7efff; font-size: 12px; text-shadow: 0 1px 5px #07182b; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="hint">W / ↑ propel · A/D or ←/→ steer · R ricochet · B bomb · T train · Esc pause</div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script>
+    const WORLD_LENGTH = 150000;
+    const MODES = [
+      { id: "classic", name: "Winter Run", detail: "Day and night alternate. Shops every 10%." },
+      { id: "longnight", name: "Polar Night", detail: "Permanent night; sharper hunters." },
+      { id: "reindeer", name: "Reindeer Rush", detail: "Reindeer only; relentless charges." },
+      { id: "scarce", name: "Scrooge's Trail", detail: "Fewer coins; shops every 25%." }
+    ];
+    const SCORE_KEY = "northbound.topRuns";
+    let screen = "menu", selectedMode = 0, player, entities, particles, snowballs, hazards;
+    let progress = 0, score = 0, coins = 0, elapsed = 0, spawnCursor = 0;
+    let maxSpeed = 7, snowResistance = 0, bombs = 1, trainOwned = false;
+    let nextWorkshop = 0.1, boss = null, runRecords = [], message = "", messageUntil = 0;
+    let lastFrame = 0, spawnClock = 0;
+
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      pixelDensity(1);
+      textFont("system-ui");
+      runRecords = loadRecords();
+      lastFrame = millis();
+    }
+
+    function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+    function loadRecords() {
+      const saved = localStorage.getItem(SCORE_KEY);
+      if (!saved) return [];
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) throw new Error("Saved run scores are not a list.");
+      return parsed.filter(run => Number.isFinite(run.score) && Number.isFinite(run.time))
+        .sort((a, b) => b.score - a.score).slice(0, 10);
+    }
+
+    function saveRecord(won) {
+      runRecords.push({ score, time: elapsed, won, mode: MODES[selectedMode].name, date: new Date().toLocaleDateString() });
+      runRecords.sort((a, b) => b.score - a.score);
+      runRecords = runRecords.slice(0, 10);
+      localStorage.setItem(SCORE_KEY, JSON.stringify(runRecords));
+    }
+
+    function startRun() {
+      screen = "play";
+      player = { x: width / 2, y: 0, vx: 0, vy: 0, r: 17, speed: 0, started: false, boostUntil: 0,
+        slowUntil: 0, slowFactor: 1, trainUntil: 0, quakeUntil: 0, enemySlowUntil: 0,
+        maxDebuffUntil: 0, maxCap: 0.5, damageDebuffUntil: 0, invertedUntil: 0, staticUntil: 0 };
+      entities = []; particles = []; snowballs = []; hazards = [];
+      progress = 0; score = 0; coins = 0; elapsed = 0; spawnCursor = 0; spawnClock = 0;
+      maxSpeed = 7; snowResistance = 0; bombs = 1; trainOwned = false;
+      boss = null; nextWorkshop = selectedMode === 3 ? 0.25 : 0.1;
+      for (let i = 0; i < 4; i++) spawnWave(-700 - i * 760);
+      lastFrame = millis();
+    }
+
+    function draw() {
+      const now = millis(), dt = Math.min((now - lastFrame) / 1000, 0.04);
+      lastFrame = now;
+      paintSky();
+      if (screen === "menu") { drawMenu(); return; }
+      if (screen === "play") updateRun(dt);
+      drawWorld();
+      drawEffects(dt);
+      drawHud();
+      if (screen === "shop") drawWorkshop();
+      if (screen === "pause") drawPause();
+      if (screen === "ended") drawEndScreen();
+    }
+
+    function paintSky() {
+      const night = screen !== "menu" && isNight();
+      background(night ? color(5, 15, 39) : color(85, 166, 205));
+      noStroke();
+      fill(night ? color(226, 238, 255, 190) : color(255, 255, 255, 70));
+      for (let i = 0; i < 55; i++) {
+        const x = (i * 197 + 31) % width, y = (i * 113 + 17) % height;
+        circle(x, y, i % 4 === 0 ? 2 : 1);
+      }
+    }
+
+    function isNight() {
+      return selectedMode === 1 || (selectedMode !== 1 && Math.floor(elapsed / 35) % 2 === 1);
+    }
+
+    function updateRun(dt) {
+      elapsed += dt;
+      if (keyIsDown(87) || keyIsDown(UP_ARROW)) {
+        const thrust = 9.5 * dt * (millis() < player.slowUntil ? 0.65 : 1);
+        player.started = true;
+        if (player.speed < 0.2) { player.vy = -maxSpeed * 0.55; player.vx = 0; }
+        player.vy -= thrust;
+      }
+      let steer = (keyIsDown(68) || keyIsDown(RIGHT_ARROW) ? 1 : 0) -
+        (keyIsDown(65) || keyIsDown(LEFT_ARROW) ? 1 : 0);
+      if (millis() < player.invertedUntil) steer *= -1;
+      player.vx += steer * 11 * dt;
+      const cap = millis() < player.maxDebuffUntil ? maxSpeed * player.maxCap : maxSpeed;
+      const boost = millis() < player.boostUntil ? maxSpeed * 0.75 : 0;
+      const effectiveCap = cap + boost;
+      const magnitude = Math.hypot(player.vx, player.vy);
+      if (magnitude > effectiveCap && magnitude > 0) {
+        player.vx *= effectiveCap / magnitude; player.vy *= effectiveCap / magnitude;
+      }
+      const drag = Math.pow(0.9998, dt * 60);
+      player.vx *= drag; player.vy *= drag;
+      if (millis() < player.staticUntil) {
+        const forced = Math.max(0.4, maxSpeed * 0.25);
+        const angle = Math.atan2(player.vy, player.vx);
+        player.vx = Math.cos(angle) * forced; player.vy = Math.sin(angle) * forced;
+      }
+      player.x = constrain(player.x + player.vx, 30, width - 30);
+      player.y += player.vy;
+      player.speed = Math.hypot(player.vx, player.vy);
+      progress = constrain(-player.y / WORLD_LENGTH, 0, 1);
+      if (player.started && player.speed < 0.12) { endRun(false, "Your momentum faded away."); return; }
+      if (player.x <= 31 || player.x >= width - 31) player.vx *= -0.75;
+      spawnClock += dt;
+      if (spawnClock > 1.5) { spawnClock = 0; spawnWave(player.y - height * random(0.7, 1.6)); }
+      updateEntities(dt);
+      updateProjectiles(dt);
+      updateHazards(dt);
+      updateBoss(dt);
+      updateParticles(dt);
+      checkWorkshop();
+      if (screen !== "play") return;
+      if (progress >= 1 && boss && boss.hp <= 0) endRun(true, "You reached the North Pole!");
+      if (player.started && player.speed < 0.12) endRun(false, "Your momentum faded away.");
+    }
+
+    function spawnWave(y) {
+      const scarce = selectedMode === 3;
+      const night = isNight();
+      const count = random(1, 3);
+      for (let i = 0; i < count; i++) {
+        const x = random(45, width - 45), roll = random();
+        const kind = chooseEnemy(roll, night);
+        if (kind) addEnemy(kind, x, y + random(-70, 70));
+      }
+      if (random() < (scarce ? 0.1 : 0.24)) entities.push({ type: "coin", x: random(50, width - 50), y, r: 12 });
+      if (random() < 0.14) entities.push({ type: "power", x: random(50, width - 50), y: y - 45, r: 17 });
+      if (random() < 0.09) entities.push({ type: "glacier", x: random(60, width - 60), y: y + 40, r: 24 });
+      if (random() < 0.38) {
+        const type = random() < 0.12 ? "stopper" : random() < 0.4 ? "ice" : "tree";
+        entities.push({ type, x: random(45, width - 45), y: y + random(-90, 90), r: type === "stopper" ? 27 : 21 });
+      }
+    }
+
+    function chooseEnemy(roll, night) {
+      if (selectedMode === 2) return "reindeer";
+      if (roll < (night ? 0.33 : 0.12)) return "thrower";
+      if (night && roll < 0.56) return "reindeer";
+      if (roll < 0.72) return "penguin";
+      return "bear";
+    }
+
+    function addEnemy(kind, x, y) {
+      const nightBuff = isNight() ? 1.3 : 1;
+      const stats = {
+        penguin: [1, 2.2, 18], thrower: [1, 1.35, 18],
+        reindeer: [3, 3.2, 22], bear: [1, 1.1, 25],
+        dasher: [2, 4.3, 20], dancer: [2, 1.1, 19], prancer: [2, 1.5, 19],
+        vixen: [2, 1.6, 20], comet: [2, 1.45, 20], cupid: [2, 1.8, 18],
+        donner: [2, 1.7, 21], blitzen: [1, 4.5, 17]
+      }[kind] || [1, 1.5, 18];
+      entities.push({ type: "enemy", kind, x, y, hp: stats[0], maxHp: stats[0],
+        speed: stats[1] * nightBuff, r: stats[2], cooldown: random(0.5, 2.5), state: "hunt",
+        stateUntil: 0, shield: false, shieldCooldown: 0, attacks: 0, dizzy: 0 });
+    }
+
+    function updateEntities(dt) {
+      const now = millis();
+      for (let i = entities.length - 1; i >= 0; i--) {
+        const e = entities[i];
+        if (Math.abs(e.y - player.y) > height * 1.5) { entities.splice(i, 1); continue; }
+        if (e.type === "enemy") {
+          if (e !== boss) updateEnemy(e, dt, now);
+          const d = dist(e.x, e.y, player.x, player.y);
+          if (d < e.r + player.r) collideEnemy(e, i);
+        } else if (e.type === "coin" && dist(e.x, e.y, player.x, player.y) < e.r + player.r) {
+          coins++; score += 25; entities.splice(i, 1); burst(e.x, e.y, "#ffe06a", 9);
+        } else if (e.type === "power" && dist(e.x, e.y, player.x, player.y) < e.r + player.r) {
+          collectPower(e); entities.splice(i, 1);
+        } else if (["ice", "tree", "stopper"].includes(e.type) && dist(e.x, e.y, player.x, player.y) < e.r + player.r) {
+          hitObstacle(e, i);
+        } else if (e.type === "glacier" && dist(e.x, e.y, player.x, player.y) < e.r + player.r) {
+          player.boostUntil = now + 2400; player.vy *= 1.18; entities.splice(i, 1);
+          showMessage("Glacier boost!"); burst(e.x, e.y, "#84f3ff", 14);
+        } else if (e.type === "iceWall" && dist(e.x, e.y, player.x, player.y) < e.r + player.r) {
+          player.vx *= -0.7; player.vy *= -0.55; e.hp -= 1;
+          if (e.hp <= 0) entities.splice(i, 1);
+        } else if (e.type === "iceWall" && boss && boss.hp > 0 &&
+          dist(e.x, e.y, boss.x, boss.y) < e.r + boss.r) {
+          boss.iceHits++; burst(e.x, e.y, "#a9f4ff", 14); entities.splice(i, 1);
+        }
+      }
+    }
+
+    function updateEnemy(e, dt, now) {
+      const dx = player.x - e.x, dy = player.y - e.y, d = Math.max(1, Math.hypot(dx, dy));
+      const speed = e.speed * (millis() < player.enemySlowUntil ? 0.35 : 1);
+      e.cooldown -= dt;
+      if (e.kind === "thrower") {
+        e.x += constrain(dx, -1, 1) * speed * dt * 12;
+        if (e.cooldown <= 0 && d < 600) {
+          snowballs.push({ x: e.x, y: e.y, vx: dx / d * 2.3, vy: dy / d * 2.3, r: 8 });
+          e.cooldown = isNight() ? 1.5 : 2.4;
+        }
+      } else if (e.kind === "bear") {
+        e.x += dx / d * speed * dt * 60 * 0.7; e.y += dy / d * speed * dt * 60 * 0.7;
+      } else if (e.kind === "dancer") {
+        e.x += dx / d * speed * dt * 60 * 0.35;
+        entities.forEach(other => {
+          const ally = other.kind === "reindeer" || ["dasher", "prancer", "vixen", "comet", "cupid", "donner", "blitzen"].includes(other.kind);
+          if (other !== e && other.type === "enemy" && ally && dist(e.x, e.y, other.x, other.y) < 280) other.hp = Math.min(other.maxHp, other.hp + dt * 0.09);
+        });
+      } else if (e.kind === "dasher" && e.state === "rest") {
+        if (now >= e.stateUntil) { e.state = "hunt"; e.cooldown = 0; }
+      } else if (e.kind === "dasher" && e.cooldown <= 0) {
+        e.state = "dash"; e.stateUntil = now + 900; e.cooldown = 6;
+      } else if (e.kind === "dasher" && e.state === "dash") {
+        e.x += dx / d * speed * dt * 60 * 2.1; e.y += dy / d * speed * dt * 60 * 2.1;
+        if (now > e.stateUntil) { e.state = "rest"; e.stateUntil = now + 5000; }
+      } else if (e.kind === "prancer" && e.cooldown <= 0) {
+        const marks = floor(random(5, 9));
+        for (let i = 0; i < marks; i++) hazards.push({
+          type: "prance", x: player.x + random(-220, 220), y: player.y + random(-170, 170),
+          r: 68, at: now + 750 + i * 120, life: now + 1650 + i * 120
+        });
+        e.cooldown = 7;
+      } else if (e.kind === "vixen") {
+        if (e.shieldCooldown > 0) e.shieldCooldown -= dt;
+        if (!e.shield && e.shieldCooldown <= 0) { e.shield = true; e.stateUntil = now + 10000; }
+        if (e.shield && now > e.stateUntil) { e.shield = false; e.shieldCooldown = 5; }
+        e.x += dx / d * speed * dt * 60; e.y += dy / d * speed * dt * 60;
+      } else if (e.kind === "comet" && e.cooldown <= 0) {
+        hazards.push({ type: "meteor", x: random(55, width - 55), y: player.y - random(180, 400), r: 21,
+          blue: random() < 0.38, at: now + 1000, life: now + 4500 });
+        e.cooldown = 2.7;
+      } else if (e.kind === "cupid" && e.cooldown <= 0) {
+        const angle = Math.atan2(dy, dx);
+        for (let i = -2; i <= 2; i++) hazards.push({
+          type: "arrow", x: e.x, y: e.y, vx: Math.cos(angle + i * 0.13) * 3,
+          vy: Math.sin(angle + i * 0.13) * 3, r: 9, at: now, life: now + 2200
+        });
+        e.cooldown = 2.8;
+      } else if (e.kind === "donner" && e.cooldown <= 0) {
+        for (let i = 0; i < 5; i++) hazards.push({
+          type: "lightning", x: random(70, width - 70), y: player.y - random(-50, 180),
+          r: 42, at: now + 650 + i * 330, life: now + 1450 + i * 330
+        });
+        e.cooldown = 6;
+      } else {
+        const chargeFactor = e.kind === "reindeer" || e.kind === "blitzen" ? 1.65 : 1;
+        e.x += dx / d * speed * dt * 60 * chargeFactor;
+        e.y += dy / d * speed * dt * 60 * chargeFactor;
+        if ((e.kind === "penguin" || e.kind === "reindeer" || e.kind === "blitzen") && e.cooldown <= 0) {
+          e.x += dx / d * e.speed * 0.18; e.y += dy / d * e.speed * 0.18;
+          e.cooldown = e.kind === "blitzen" ? 4.5 : e.kind === "reindeer" ? 1.3 : 2.5;
+        }
+      }
+      e.x = constrain(e.x, 25, width - 25);
+    }
+
+    function collideEnemy(e, index) {
+      if (e.kind === "boss") {
+        if (e.hp <= 0) { entities.splice(index, 1); return; }
+        damageBoss(Math.max(1, player.speed * 0.12)); player.vx *= -0.65; player.vy *= -0.55; return;
+      }
+      if (e.kind === "bear") {
+        if (millis() >= (e.contactUntil || 0)) {
+          loseSpeed(0.8); e.contactUntil = millis() + 700;
+          const dx = player.x - e.x, dy = player.y - e.y, d = Math.max(1, Math.hypot(dx, dy));
+          player.vx += dx / d * 1.4; player.vy += dy / d * 1.4;
+          score += 2; burst(e.x, e.y, "#dceeff", 5);
+        }
+        return;
+      }
+      if (e.kind === "vixen" && e.shield) { player.vx *= -0.8; player.vy *= -0.8; return; }
+      if (player.speed >= maxSpeed * 0.82 || millis() < player.trainUntil) {
+        if (millis() < player.damageDebuffUntil && e.kind !== "boss") {
+          e.hp -= 0.5;
+          if (e.hp <= 0) killEnemy(e, index);
+          return;
+        }
+        killEnemy(e, index);
+      } else {
+        loseSpeed(e.kind === "reindeer" ? 1.6 : 1.1);
+        player.vx *= -0.7; player.vy *= -0.7;
+      }
+    }
+
+    function killEnemy(e, index) {
+      if (e.kind === "vixen" && e.shield) return;
+      e.hp -= millis() < e.dizzy ? 2 : 1;
+      burst(e.x, e.y, e.kind === "reindeer" ? "#ff7070" : "#c8f4ff", 13);
+      if (e.hp > 0) return;
+      score += e.kind === "reindeer" ? 180 : e.kind === "bear" ? 12 : 60;
+      entities.splice(index, 1);
+      if (e.kind === "dancer") showMessage("Dancer defeated: reindeer healing stopped!");
+    }
+
+    function hitObstacle(e, index) {
+      if (millis() < player.trainUntil) {
+        score += 20; burst(e.x, e.y, "#ffd56a", 12); entities.splice(index, 1); return;
+      }
+      if (e.type === "stopper") { player.vx *= 0.18; player.vy *= 0.18; loseSpeed(2); }
+      else { player.vx *= 0.68; player.vy *= 0.68; loseSpeed(0.65); }
+      burst(e.x, e.y, "#dceeff", 8);
+      entities.splice(index, 1);
+    }
+
+    function loseSpeed(amount) {
+      const resistance = Math.max(0.2, 1 - snowResistance * 0.16);
+      player.vx *= Math.max(0.25, 1 - amount * resistance * 0.18);
+      player.vy *= Math.max(0.25, 1 - amount * resistance * 0.18);
+      player.speed = Math.hypot(player.vx, player.vy);
+    }
+
+    function collectPower() {
+      if (isNight()) {
+        const trick = floor(random(4));
+        if (trick === 0) { player.maxDebuffUntil = millis() + 7000; player.maxCap = 0.5; showMessage("Trick! Max speed halved."); }
+        else if (trick === 1) { player.slowUntil = millis() + 5000; loseSpeed(1.2); showMessage("Trick! A sticky snow curse."); }
+        else if (trick === 2) { player.invertedUntil = millis() + 5000; showMessage("Trick! Controls reversed."); }
+        else { player.damageDebuffUntil = millis() + 6000; showMessage("Trick! Ricochet damage weakened."); }
+      } else {
+        const gift = floor(random(3));
+        if (gift === 0) { player.trainUntil = millis() + 7000; showMessage("Gift: Snowplow train!"); }
+        if (gift === 1) { player.quakeUntil = millis() + 2500; entities.filter(e => e.type === "enemy").forEach(e => { e.x += (e.x < player.x ? -1 : 1) * 180; e.y += (e.y < player.y ? -1 : 1) * 180; }); showMessage("Gift: Earthquake shockwave!"); }
+        if (gift === 2) { player.enemySlowUntil = millis() + 7000; showMessage("Gift: Time-slowing snow globe!"); }
+      }
+      score += 10; burst(player.x, player.y, "#fff39b", 15);
+    }
+
+    function updateProjectiles(dt) {
+      for (let i = snowballs.length - 1; i >= 0; i--) {
+        const s = snowballs[i]; s.x += s.vx * 60 * dt; s.y += s.vy * 60 * dt;
+        if (dist(s.x, s.y, player.x, player.y) < s.r + player.r) {
+          loseSpeed(1.2);
+          player.slowUntil = millis() + 900; snowballs.splice(i, 1); burst(player.x, player.y, "#b8ecff", 6);
+        } else if (Math.abs(s.y - player.y) > height) snowballs.splice(i, 1);
+      }
+    }
+
+    function updateHazards(dt) {
+      const now = millis();
+      for (let i = hazards.length - 1; i >= 0; i--) {
+        const h = hazards[i];
+        if (h.type === "meteor" && now >= h.at && !h.impact) {
+          h.impact = true;
+          entities = entities.filter(e => {
+            if (!["ice", "tree", "stopper", "iceWall"].includes(e.type) || dist(e.x, e.y, h.x, h.y) > 95) return true;
+            burst(e.x, e.y, "#ffbd72", 8);
+            return false;
+          });
+        }
+        if (h.type === "arrow" && now >= h.at) { h.x += h.vx * 60 * dt; h.y += h.vy * 60 * dt; }
+        if (now >= h.at && dist(h.x, h.y, player.x, player.y) < h.r + player.r) {
+          if (h.type === "meteor" && h.blue) {
+            score += 30; burst(h.x, h.y, "#63ddff", 22);
+            entities = entities.filter(e => {
+              if (e.type !== "enemy" || dist(e.x, e.y, h.x, h.y) >= 160 || (e.kind === "vixen" && e.shield)) return true;
+              if (e.kind === "boss") { damageBoss(12); return true; }
+              e.hp -= 2;
+              if (e.hp <= 0) { score += e.kind === "reindeer" ? 180 : 60; burst(e.x, e.y, "#bdefff", 10); return false; }
+              return true;
+            });
+          } else if (h.type === "lightning") {
+            if (player.speed < maxSpeed * 0.96) { endRun(false, "Donner's lightning caught you below top speed."); return; }
+            player.staticUntil = now + 10000;
+          } else if (h.type === "arrow") player.invertedUntil = now + 4500;
+          else if (h.type === "prance") { loseSpeed(1.1); player.damageDebuffUntil = now + 5000; player.maxDebuffUntil = now + 5000; player.maxCap = 0.3; }
+          else if (h.type === "meteor") { loseSpeed(1.5); burst(h.x, h.y, "#ffad66", 15); }
+          h.life = 0;
+        }
+        if (now > h.life) hazards.splice(i, 1);
+      }
+    }
+
+    function checkWorkshop() {
+      if (progress >= nextWorkshop && progress < 0.9) {
+        screen = "shop"; player.vx = 0; player.vy = 0; player.speed = 0;
+        showMessage("Toy workshop reached. Catch your breath and shop.");
+      }
+    }
+
+    function drawWorkshop() {
+      panel(width * 0.5 - 240, height * 0.5 - 205, 480, 410, "#173d55");
+      textAlign(CENTER, CENTER); fill("#fff3c4"); textSize(27); text("TOY WORKSHOP", width / 2, height / 2 - 165);
+      fill("#d8f1ff"); textSize(14); text(`Coins: ${coins}   ·   Workshop ${Math.round(nextWorkshop * 100)}%`, width / 2, height / 2 - 132);
+      const offers = [
+        ["Upgrade max speed (+1)", 5], ["Snow resistance (+1)", 4],
+        ["Buy bomb", 3], ["Snowplow train power", 8]
+      ];
+      offers.forEach((offer, i) => {
+        const y = height / 2 - 90 + i * 48;
+        button(width / 2 - 190, y, 380, 38, `${offer[0]}  ·  ${offer[1]} coins`, () => buyUpgrade(i, offer[1]));
+      });
+      button(width / 2 - 115, height / 2 + 125, 230, 43, "Back on the trail", continueRun);
+      fill("#aac9da"); textSize(12); text("The workshop restores momentum; choose upgrades before continuing.", width / 2, height / 2 + 185);
+    }
+
+    function buyUpgrade(index, cost) {
+      if (coins < cost) { showMessage("Not enough coins."); return; }
+      coins -= cost;
+      if (index === 0) maxSpeed += 1;
+      if (index === 1) snowResistance = Math.min(5, snowResistance + 1);
+      if (index === 2) bombs++;
+      if (index === 3) trainOwned = true;
+      showMessage("Upgrade purchased!");
+    }
+
+    function continueRun() {
+      player.vy = -maxSpeed * 0.52; player.speed = Math.abs(player.vy); player.started = true;
+      screen = "play";
+      nextWorkshop = selectedMode === 3 ? nextWorkshop + 0.25 : nextWorkshop + 0.1;
+    }
+
+    function updateBoss(dt) {
+      if (progress < 0.9 || (boss && boss.hp <= 0)) return;
+      if (!boss) {
+        boss = { x: width / 2, y: player.y - 440, hp: 150, maxHp: 150, r: 38,
+          cooldown: 0, iceHits: 0, alliesCalled: false, name: "Rudolph" };
+        entities.push(boss); showMessage("Rudolph blocks the path to the North Pole!");
+      }
+      const now = millis(), dx = player.x - boss.x, dy = player.y - boss.y, d = Math.max(1, Math.hypot(dx, dy));
+      boss.x += dx / d * 1.7 * dt * 60; boss.y += dy / d * 1.1 * dt * 60;
+      if (d < 175) { player.slowUntil = now + 1000; loseSpeed(0.8 * dt); }
+      boss.cooldown -= dt;
+      if (boss.cooldown <= 0) {
+        entities.push({ type: "iceWall", x: constrain(player.x + random(-160, 160), 50, width - 50),
+          y: player.y - random(130, 230), r: 28, hp: 2 });
+        boss.cooldown = 3.2;
+      }
+      if (boss.iceHits >= 5) { boss.dizzy = now + 7000; boss.iceHits = 0; showMessage("Rudolph is dizzy! His guard is down."); }
+      if (boss.hp <= boss.maxHp / 2 && !boss.alliesCalled) { boss.alliesCalled = true; summonReindeer(); }
+    }
+
+    function summonReindeer() {
+      const roster = ["dasher", "dancer", "prancer", "vixen", "comet", "cupid", "donner", "blitzen"];
+      roster.forEach((name, i) => addEnemy(name, width * (0.12 + i * 0.105), player.y - random(260, 620)));
+      showMessage("Rudolph calls his team!");
+    }
+
+    function damageBoss(amount) {
+      if (!boss || boss.hp <= 0) return;
+      const vulnerable = millis() < boss.dizzy;
+      const damage = amount * (vulnerable ? 2.2 : 0.45) * (millis() < player.damageDebuffUntil ? 0.5 : 1);
+      boss.hp = Math.max(0, boss.hp - damage);
+      if (boss.hp === 0) {
+        const index = entities.indexOf(boss);
+        if (index >= 0) entities.splice(index, 1);
+        score += 1500; burst(boss.x, boss.y, "#ff4242", 55); showMessage("Rudolph is beaten! Keep moving north!");
+      }
+    }
+
+    function drawWorld() {
+      push();
+      const anchorY = height * 0.72;
+      noStroke(); fill(236, 249, 255, 235); rect(0, anchorY - 5, width, height - anchorY + 10);
+      fill("#effaff");
+      for (let i = 0; i < 11; i++) {
+        const x = (i * 151 + 37) % width;
+        const y = ((i * 173 - player.y * 0.22) % height + height) % height;
+        triangle(x - 30, y + 38, x, y - 35, x + 34, y + 38);
+        triangle(x - 20, y + 12, x, y - 35, x + 21, y + 12);
+      }
+      entities.forEach(e => drawEntity(e, anchorY));
+      snowballs.forEach(s => { fill("#b8f1ff"); circle(s.x, s.y - player.y + anchorY, s.r * 2); });
+      hazards.forEach(h => drawHazard(h, anchorY));
+      drawBossBar();
+      drawPlayer(anchorY);
+      pop();
+    }
+
+    function drawEntity(e, anchorY) {
+      const sy = e.y - player.y + anchorY;
+      if (sy < -80 || sy > height + 80) return;
+      noStroke();
+      if (e.type === "coin") { fill("#ffd74f"); circle(e.x, sy, e.r * 2); fill("#fff3b0"); circle(e.x - 3, sy - 3, 5); }
+      else if (e.type === "power") { fill(isNight() ? "#ba76ff" : "#7ff0db"); starShape(e.x, sy, e.r); }
+      else if (e.type === "glacier") { fill("#53d9f3"); ellipse(e.x, sy, e.r * 2.3, e.r * 1.4); fill("#d7fbff"); ellipse(e.x, sy - 4, e.r * 1.4, 8); }
+      else if (e.type === "iceWall") { fill("#98dcec"); rect(e.x - 27, sy - 25, 54, 50, 9); }
+      else if (e.type === "ice" || e.type === "stopper") { fill(e.type === "stopper" ? "#627b90" : "#c4efff"); triangle(e.x - e.r, sy + e.r, e.x, sy - e.r, e.x + e.r, sy + e.r); }
+      else if (e.type === "tree") { fill("#286852"); triangle(e.x - 24, sy + 23, e.x, sy - 26, e.x + 24, sy + 23); fill("#765d44"); rect(e.x - 4, sy + 15, 8, 15); }
+      else if (e.type === "enemy") drawEnemy(e, sy);
+    }
+
+    function drawEnemy(e, y) {
+      const palette = { penguin: "#263c55", thrower: "#815bb0", reindeer: "#8c493e", bear: "#8a7567",
+        dasher: "#b85849", dancer: "#cf8290", prancer: "#ac7b4e", vixen: "#d07869",
+        comet: "#6585c5", cupid: "#d777a4", donner: "#686b93", blitzen: "#a65244", boss: "#a9323e" };
+      fill(palette[e.kind] || "#31465a"); ellipse(e.x, y, e.r * 1.65, e.r * 2);
+      fill("#fff"); circle(e.x - 5, y - 3, 5); circle(e.x + 5, y - 3, 5);
+      fill("#1b2435"); circle(e.x - 5, y - 3, 2); circle(e.x + 5, y - 3, 2);
+      if (e.kind === "reindeer" || e.kind === "boss" || e.kind === "dasher" || e.kind === "blitzen") {
+        stroke("#f1dfcf"); strokeWeight(2); line(e.x - 8, y - e.r, e.x - 15, y - e.r - 9); line(e.x + 8, y - e.r, e.x + 15, y - e.r - 9); noStroke();
+      }
+      if (e.kind === "boss") { fill("#ff2929"); circle(e.x, y + 5, 9); fill("#fff"); textAlign(CENTER); textSize(11); text("RUDOLPH", e.x, y - e.r - 13); }
+      if (e.kind === "vixen" && e.shield) { noFill(); stroke("#85cfff"); strokeWeight(3); circle(e.x, y, e.r * 2.6); noStroke(); }
+      if (e.hp < e.maxHp) { fill("#411f2d"); rect(e.x - 18, y - e.r - 8, 36, 4); fill("#ff7777"); rect(e.x - 18, y - e.r - 8, 36 * e.hp / e.maxHp, 4); }
+    }
+
+    function drawHazard(h, anchorY) {
+      const y = h.y - player.y + anchorY;
+      if (h.type === "prance") { noFill(); stroke(millis() < h.at ? "#ffe67b" : "#ff654e"); strokeWeight(3); circle(h.x, y, h.r * 2); noStroke(); }
+      if (h.type === "meteor") { fill(h.blue ? "#45dfff" : "#fa9252"); circle(h.x, y, h.r * 1.7); fill("#fff2c4"); circle(h.x - 4, y - 5, 7); }
+      if (h.type === "arrow") { fill("#ff92ce"); triangle(h.x - 8, y + 8, h.x + 8, y + 8, h.x, y - 10); }
+      if (h.type === "lightning") { noFill(); stroke(millis() < h.at ? "#fbf890" : "#fbec4e"); strokeWeight(4); circle(h.x, y, h.r * 2); line(h.x, y - h.r, h.x - 12, y); line(h.x - 12, y, h.x + 6, y + 3); noStroke(); }
+    }
+
+    function drawPlayer(anchorY) {
+      const py = anchorY;
+      if (millis() < player.quakeUntil) { noFill(); stroke("#afffff"); strokeWeight(4); circle(player.x, py, 95); noStroke(); }
+      if (millis() < player.slowUntil) { noFill(); stroke("#82cfff"); strokeWeight(3); circle(player.x, py, 58); noStroke(); }
+      fill(millis() < player.trainUntil ? "#d64437" : "#f7fbff"); stroke("#7895a5"); strokeWeight(2); circle(player.x, py, player.r * 2); noStroke();
+      fill("#d94c57"); circle(player.x, py + 4, 10); fill("#142b42"); circle(player.x - 5, py - 4, 4); circle(player.x + 5, py - 4, 4);
+    }
+
+    function drawBossBar() {
+      if (!boss || boss.hp <= 0) return;
+      const x = width * 0.25, y = 18, w = width * 0.5;
+      fill("#391d2b"); rect(x, y, w, 14, 7); fill("#e74b50"); rect(x, y, w * boss.hp / boss.maxHp, 14, 7);
+      fill("#fff"); textAlign(CENTER); textSize(12); text(`RUDOLPH · ${Math.ceil(boss.hp)} HP · ${boss.iceHits}/5 ice crashes`, width / 2, 48);
+    }
+
+    function drawHud() {
+      noStroke(); fill(4, 24, 42, 205); rect(12, 12, 215, 108, 12);
+      fill("#f5fbff"); textAlign(LEFT, TOP); textSize(14);
+      text(`Progress  ${Math.floor(progress * 100)}%`, 25, 22);
+      text(`Speed  ${player.speed.toFixed(1)} / ${maxSpeed}`, 25, 44);
+      text(`Score  ${score}    Coins  ${coins}`, 25, 66);
+      text(`Distance  ${Math.floor(progress * WORLD_LENGTH).toLocaleString()} / ${WORLD_LENGTH.toLocaleString()} m`, 25, 88);
+      drawRouteMap();
+      if (millis() < messageUntil) { textAlign(CENTER); fill("#fff3b0"); textSize(16); text(message, width / 2, height - 48); }
+    } 
+
+    function drawRouteMap() {
+      const mapWidth = Math.min(620, width - 40);
+      const x = (width - mapWidth) / 2;
+      const y = 153;
+      const lineStart = x + 12, lineEnd = x + mapWidth - 12, lineWidth = lineEnd - lineStart;
+      const nextStop = Math.min(nextWorkshop, 0.9);
+      const metersToStop = Math.max(0, Math.ceil((nextStop - progress) * WORLD_LENGTH));
+
+      noStroke(); fill(4, 24, 42, 190); rect(x, y - 30, mapWidth, 65, 12);
+      fill("#e9f7ff"); textAlign(LEFT, CENTER); textSize(11);
+      text(`NEXT WORKSHOP · ${metersToStop.toLocaleString()} m`, x + 10, y - 20);
+      textAlign(RIGHT, CENTER); text(`${Math.floor(progress * WORLD_LENGTH).toLocaleString()} / 150,000 m`, x + mapWidth - 10, y - 20);
+
+      stroke("#52758a"); strokeWeight(5); line(lineStart, y + 9, lineEnd, y + 9);
+      stroke("#75d7ec"); strokeWeight(5);
+      line(lineStart, y + 9, lineStart + lineWidth * progress, y + 9);
+      noStroke();
+
+      const interval = selectedMode === 3 ? 0.25 : 0.1;
+      const workshopCount = Math.floor((0.9 - 0.00001) / interval);
+      for (let i = 1; i <= workshopCount; i++) {
+        const mark = i * interval;
+        const mx = lineStart + lineWidth * mark;
+        drawWorkshopMarker(mx, y + 9, Math.abs(mark - nextStop) < 0.001);
+      }
+
+      const bossX = lineStart + lineWidth * 0.9;
+      fill("#f07878"); circle(bossX, y + 9, 8);
+      fill("#fff"); textAlign(CENTER, TOP); textSize(9); text("RUDOLPH", bossX, y + 19);
+      fill("#fff2bd"); circle(lineEnd, y + 9, 9);
+      fill("#fff"); textAlign(LEFT, TOP); text("POLE", lineEnd - 3, y + 19);
+
+      fill("#ffffff"); stroke("#123249"); strokeWeight(2);
+      circle(lineStart + lineWidth * progress, y + 9, 12);
+      noStroke();
+    }
+
+    function drawWorkshopMarker(x, y, isNext) {
+      push();
+      rectMode(CENTER);
+      if (isNext) { noStroke(); fill(255, 219, 112, 75); circle(x, y - 5, 28); }
+      noStroke();
+      fill("#8b3f3c"); rect(x, y - 3, 16, 11, 2);
+      fill("#d75a4c"); triangle(x - 11, y - 7, x, y - 17, x + 11, y - 7);
+      fill("#fff6dc"); rect(x, y - 8, 18, 2, 1);
+      fill("#ffd66b"); rect(x - 4, y - 3, 3, 4, 1); rect(x + 4, y - 3, 3, 4, 1);
+      fill("#583735"); rect(x, y, 3, 5);
+      fill("#e9f7ff"); textAlign(CENTER, TOP); textSize(8);
+      text(isNext ? "NEXT" : "SHOP", x, y + 5);
+      pop();
+    }
+
+    function drawMenu() {
+      textAlign(CENTER, CENTER); fill("#f4fcff"); textSize(Math.max(42, Math.min(64, width * 0.05))); text("NORTHBOUND", width / 2, height * 0.13);
+      fill("#c8eaff"); textSize(21); text("A winter dash to the North Pole", width / 2, height * 0.19);
+      fill("#fff2be"); textSize(16); text("Choose your challenge", width / 2, height * 0.27);
+      const cardW = Math.min(340, (width - 72) / 2), cardH = 92, gap = 14;
+      const totalW = cardW * 2 + gap, startX = width / 2 - totalW / 2, startY = height * 0.32;
+      MODES.forEach((mode, i) => {
+        const col = i % 2, row = Math.floor(i / 2), x = startX + col * (cardW + gap), y = startY + row * (cardH + 10);
+        fill(selectedMode === i ? "#287997" : "#163c58"); stroke(selectedMode === i ? "#ffe47b" : "#4c7590"); strokeWeight(2); rect(x, y, cardW, cardH, 12); noStroke();
+        fill("#fff"); textSize(19); text(mode.name, x + cardW / 2, y + 25);
+        fill("#c8e6f4"); textSize(13); text(mode.detail, x + 10, y + 57, cardW - 20, 34);
+      });
+      button(width / 2 - 135, startY + 2 * (cardH + 10) + 10, 270, 50, "Start expedition", startRun);
+      const listY = startY + 2 * (cardH + 10) + 84;
+      fill("#fff2be"); textSize(18); text("TOP 10 RUNS", width / 2, listY);
+      fill("#e6f6ff"); textSize(12);
+      const rows = runRecords.slice(0, 10);
+      if (!rows.length) text("Your first expedition starts now.", width / 2, listY + 25);
+      textAlign(CENTER, CENTER); textSize(12);
+      rows.forEach((run, i) => {
+        const col = i < 5 ? 0 : 1, row = i % 5;
+        const label = `${i + 1}. ${run.score} · ${formatTime(run.time)} · ${run.mode}${run.won ? " ★" : ""}`;
+        text(label, width * (col === 0 ? 0.02 : 0.52), listY + 24 + row * 19, width * 0.46, 18);
+      });
+    }
+
+    function drawPause() {
+      panel(width / 2 - 170, height / 2 - 78, 340, 156, "#183d54");
+      fill("#fff"); textAlign(CENTER); textSize(28); text("PAUSED", width / 2, height / 2 - 30);
+      button(width / 2 - 105, height / 2 + 3, 210, 42, "Resume", () => { screen = "play"; lastFrame = millis(); });
+    }
+
+    function drawEndScreen() {
+      panel(width / 2 - 220, height / 2 - 115, 440, 230, "#173d55");
+      fill("#fff2be"); textAlign(CENTER); textSize(30); text(progress >= 1 && boss && boss.hp <= 0 ? "NORTH POLE REACHED!" : "EXPEDITION OVER", width / 2, height / 2 - 67);
+      fill("#e3f6ff"); textSize(16); text(`${message}\nScore: ${score}   ·   Time: ${formatTime(elapsed)}`, width / 2, height / 2 - 17);
+      button(width / 2 - 105, height / 2 + 45, 210, 44, "Return to menu", () => { screen = "menu"; runRecords = loadRecords(); });
+    }
+
+    function drawEffects(dt) {
+      if (screen === "play") {
+        particles.forEach(p => { fill(p.color); noStroke(); circle(p.x, p.y - player.y + height * 0.72, p.r); });
+      }
+    }
+
+    function updateParticles(dt) {
+      particles.forEach(p => { p.x += p.vx; p.y += p.vy; p.vx *= 0.97; p.vy *= 0.97; p.life -= dt; });
+      particles = particles.filter(p => p.life > 0);
+    }
+
+    function burst(x, y, colorValue, count) {
+      for (let i = 0; i < count; i++) particles.push({ x, y, vx: random(-3, 3), vy: random(-3, 3), r: random(3, 8), life: random(0.3, 0.9), color: colorValue });
+    }
+
+    function starShape(x, y, radius) {
+      beginShape();
+      for (let i = 0; i < 10; i++) {
+        const angle = -HALF_PI + i * PI / 5, r = i % 2 ? radius * 0.48 : radius;
+        vertex(x + cos(angle) * r, y + sin(angle) * r);
+      }
+      endShape(CLOSE);
+    }
+
+    function drawBomb() {
+      if (!bombs || screen !== "play") { showMessage(bombs ? "Bombs can only be used on the trail." : "No bombs left."); return; }
+      bombs--; const radius = 185;
+      entities = entities.filter(e => {
+        if (e === boss) { damageBoss(18); return true; }
+        if (!["enemy", "ice", "tree", "stopper", "iceWall"].includes(e.type) || dist(e.x, e.y, player.x, player.y) > radius) return true;
+        if (e.kind === "vixen" && e.shield) return true;
+        if (e.type === "enemy") score += e.kind === "reindeer" ? 180 : 60;
+        return false;
+      });
+      hazards = hazards.filter(h => dist(h.x, h.y, player.x, player.y) > radius);
+      burst(player.x, player.y, "#ffd264", 45); showMessage("Bomb blast cleared the snow!");
+    }
+
+    function ricochet() {
+      if (screen !== "play" || player.speed < maxSpeed * 0.93) { showMessage("Reach top speed to ricochet."); return; }
+      let target = null;
+      entities.forEach(e => { if (e.type === "enemy" && e.kind !== "bear" && dist(e.x, e.y, player.x, player.y) < 230 && (!target || dist(e.x, e.y, player.x, player.y) < dist(target.x, target.y, player.x, player.y))) target = e; });
+      if (!target) { showMessage("No enemy close enough to ricochet into."); return; }
+      const chain = [];
+      while (target && chain.length < 5) {
+        chain.push(target);
+        const previous = target;
+        target = entities.filter(e => e.type === "enemy" && e.kind !== "bear" && !chain.includes(e) && dist(e.x, e.y, previous.x, previous.y) < 205)
+          .sort((a, b) => dist(a.x, a.y, previous.x, previous.y) - dist(b.x, b.y, previous.x, previous.y))[0];
+      }
+      chain.forEach((enemy, i) => {
+        if (enemy.kind === "boss") { damageBoss(12); return; }
+        if (enemy.kind === "vixen" && enemy.shield) { player.vx *= -1; return; }
+        const damage = millis() < enemy.dizzy ? 2 : 1;
+        enemy.hp -= damage * (millis() < player.damageDebuffUntil ? 0.5 : 1);
+        burst(enemy.x, enemy.y, "#ffffff", 12);
+        if (enemy.hp <= 0) {
+          score += enemy.kind === "reindeer" ? 180 : 60;
+          entities.splice(entities.indexOf(enemy), 1);
+        }
+        const angle = Math.atan2(enemy.y - player.y, enemy.x - player.x) + random(-0.75, 0.75);
+        player.vx = Math.cos(angle) * maxSpeed; player.vy = Math.sin(angle) * maxSpeed;
+        if (millis() < player.damageDebuffUntil) { player.vx *= 0.65; player.vy *= 0.65; }
+      });
+      showMessage(`${chain.length}-enemy ricochet!`);
+    }
+
+    function endRun(won, reason) {
+      if (screen === "ended") return;
+      message = reason; score += Math.floor(progress * 500); saveRecord(won); screen = "ended";
+    }
+
+    function showMessage(value) { message = value; messageUntil = millis() + 2400; }
+    function formatTime(seconds) { const m = floor(seconds / 60), s = floor(seconds % 60); return `${m}:${String(s).padStart(2, "0")}`; }
+    function panel(x, y, w, h, colorValue) { noStroke(); fill(4, 17, 33, 215); rect(x + 6, y + 8, w, h, 18); fill(colorValue); rect(x, y, w, h, 18); }
+
+    function button(x, y, w, h, label, action) {
+      const inside = mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h;
+      fill(inside ? "#3d9bb5" : "#246a85"); stroke("#bcecff"); strokeWeight(1); rect(x, y, w, h, 10); noStroke();
+      fill("#fff"); textAlign(CENTER, CENTER); textSize(15); text(label, x + w / 2, y + h / 2);
+      if (inside && mouseIsPressed && !button.wasPressed) { button.wasPressed = true; action(); }
+      if (!mouseIsPressed) button.wasPressed = false;
+    }
+
+    function mousePressed() {
+      if (screen === "menu") {
+        const cardW = Math.min(340, (width - 72) / 2), cardH = 92, gap = 14;
+        const startX = width / 2 - (cardW * 2 + gap) / 2, startY = height * 0.32;
+        MODES.forEach((_, i) => {
+          const x = startX + (i % 2) * (cardW + gap), y = startY + Math.floor(i / 2) * (cardH + 10);
+          if (mouseX >= x && mouseX <= x + cardW && mouseY >= y && mouseY <= y + cardH) selectedMode = i;
+        });
+      }
+    }
+
+    function keyPressed() {
+      if ((key === "r" || key === "R") && screen === "play") ricochet();
+      if ((key === "b" || key === "B") && screen === "play") drawBomb();
+      if ((key === "t" || key === "T") && screen === "play") {
+        if (!trainOwned) showMessage("Buy the snowplow train at a workshop first.");
+        else { player.trainUntil = millis() + 7000; showMessage("Snowplow train activated!"); }
+      }
+      if (keyCode === ESCAPE) {
+        if (screen === "play") screen = "pause";
+        else if (screen === "pause") { screen = "play"; lastFrame = millis(); }
+      }
+      if (screen === "ended" && (key === "Enter" || key === " ")) screen = "menu";
+    }
+  </script>
+</body>
+</html>
